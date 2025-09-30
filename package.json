@@ -1,0 +1,32 @@
+{
+    "name": "galadex-arb-bot",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "description": "Arbitrage bot between Raydium and GalaSwap (GalaDEX) on Solana, in TypeScript.",
+    "scripts": {
+        "build": "tsc -p .",
+        "start": "node dist/index.js",
+        "dev": "tsx watch src/index.ts",
+        "typecheck": "tsc -p . --noEmit"
+    },
+    "dependencies": {
+        "@gala-chain/gswap-sdk": "^0.0.7",
+        "@jup-ag/api": "^6.0.44",
+        "@noble/secp256k1": "^2.1.0",
+        "@raydium-io/raydium-sdk-v2": "^0.2.29-alpha",
+        "@solana/spl-token": "^0.4.14",
+        "@solana/web3.js": "^1.95.3",
+        "bn.js": "^5.2.1",
+        "bs58": "^5.0.0",
+        "dotenv": "^16.4.5",
+        "ethereum-cryptography": "^2.1.2"
+    },
+    "devDependencies": {
+        "@types/bn.js": "^5.1.5",
+        "@types/node": "^22.7.4",
+        "ts-node": "^10.9.2",
+        "tsx": "^4.19.2",
+        "typescript": "^5.6.3"
+    }
+}

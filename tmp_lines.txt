@@ -1,0 +1,209 @@
+﻿   1: import type { IExchange } from './IExchange.js';
+   2: import type { PoolState, Quote } from '../types.js';
+   3: import { config } from '../config.js';
+   4: import { constantProductOutAmount, toUi, fromUi } from '../utils/math.js';
+   5: import { TOKENS, getToken } from '../tokens.js';
+   6: import { getSignature, getEthAddress } from '../utils/galaSign.js';
+   7: 
+   8: // Placeholder adapter for GalaSwap (GalaDEX). You must provide:
+   9: // - Program ID (GALADEX_PROGRAM_ID)
+  10: // - Pool discovery/decoding logic
+  11: // - Swap instruction construction
+  12: 
+  13: export class GalaSwapExchange implements IExchange {
+  14:   public readonly name = 'GalaSwap';
+  15:   private pools: PoolState[] = [];
+  16:   private lastRequestTime = 0;
+  17:   private minRequestIntervalMs = 60; // ~1000 req/min
+  18: 
+  19:     constructor() {
+  20:     const hasProgram = !!config.galadexProgramId;
+  21:     const hasApi = !!config.galadexApiBase;
+  22:     if (!hasProgram && !hasApi) {
+  23:       console.warn('[GalaSwap] Neither GALADEX_API_BASE nor GALADEX_PROGRAM_ID set. Adapter will be inactive.');
+  24:       return;
+  25:     }
+  26:     if (!hasProgram) {
+  27:       console.warn('[GalaSwap] GALADEX_PROGRAM_ID not set. On-chain pool discovery disabled; HTTP mode only.');
+  28:     }
+  29:     if (!hasApi) {
+  30:       console.warn('[GalaSwap] GALADEX_API_BASE not set. HTTP quotes/swaps disabled; on-chain only.');
+  31:     }
+  32:   }
+  33:   }
+  34: 
+  35:   private async rateLimit() {
+  36:     const now = Date.now();
+  37:     const dt = now - this.lastRequestTime;
+  38:     if (dt < this.minRequestIntervalMs) {
+  39:       await new Promise((r) => setTimeout(r, this.minRequestIntervalMs - dt));
+  40:     }
+  41:     this.lastRequestTime = Date.now();
+  42:   }
+  43: 
+  44:   async getPools(pair?: [string, string]): Promise<PoolState[]> {
+  45:     // TODO: fetch + decode real pools using program ID and account parsing
+  46:     if (this.pools.length === 0 && (config.galadexForcePools?.length || 0) > 0) {
+  47:       // Optionally pre-load known pools here if you have reserve snapshots
+  48:     }
+  49:     // Dev-only: seed a mock pool if empty to allow dry-run quotes
+  50:     if (this.pools.length === 0 && pair) {
+  51:       const [a, b] = pair;
+  52:       if ((a === 'GALA' && b === 'SOL') || (a === 'SOL' && b === 'GALA')) {
+  53:         this.pools.push({
+  54:           id: 'galaswap-mock-gala-sol',
+  55:           programId: config.galadexProgramId || 'GalaSwapMockProgram',
+  56:           tokenA: TOKENS.GALA || TOKENS.SOL,
+  57:           tokenB: TOKENS.SOL,
+  58:           reserveA: 50_000_000n * 10n ** BigInt((TOKENS.GALA || TOKENS.SOL).decimals),
+  59:           reserveB: 210_000n * 10n ** BigInt(TOKENS.SOL.decimals), // slightly different ratio
+  60:           feeBps: 30,
+  61:         });
+  62:       } else if ((a === 'SOL' && b === 'USDC') || (a === 'USDC' && b === 'SOL')) {
+  63:         this.pools.push({
+  64:           id: 'galaswap-mock-sol-usdc',
+  65:           programId: config.galadexProgramId || 'GalaSwapMockProgram',
+  66:           tokenA: TOKENS.SOL,
+  67:           tokenB: TOKENS.USDC,
+  68:           reserveA: 10_000n * 10n ** BigInt(TOKENS.SOL.decimals),
+  69:           reserveB: 1_510_000n * 10n ** BigInt(TOKENS.USDC.decimals), // ~151 USDC/SOL
+  70:           feeBps: 30,
+  71:         });
+  72:       }
+  73:     }
+  74:     if (!pair) return this.pools;
+  75:     const [a, b] = pair;
+  76:     return this.pools.filter(
+  77:       (p) =>
+  78:         (p.tokenA.symbol === a && p.tokenB.symbol === b) ||
+  79:         (p.tokenA.symbol === b && p.tokenB.symbol === a)
+  80:     );
+  81:   }
+  82: 
+  83:   async getQuote(inSymbol: string, outSymbol: string, inAmount: bigint): Promise<Quote | null> {
+  84:     // Prefer HTTP quote when API base present and pair is GALA/SOL
+  85:     if (config.galadexApiBase) {
+  86:       const a = inSymbol.toUpperCase();
+  87:       const b = outSymbol.toUpperCase();
+  88:       const isBuy = a === 'SOL' && b === 'GALA';
+  89:       const isSell = a === 'GALA' && b === 'SOL';
+  90:       if (isBuy || isSell) {
+  91:         try {
+  92:           const baseInfo = getToken(a === 'SOL' ? 'SOL' : 'GALA');
+  93:           const outInfo = getToken(b);
+  94:           if (!baseInfo || !outInfo) return null;
+  95:           const amountInUi = toUi(inAmount, baseInfo.decimals);
+  96:           // Build query
+  97:           const tokenIn = isBuy ? 'GSOL$Unit$none$none' : 'GALA$Unit$none$none';
+  98:           const tokenOut = isBuy ? 'GALA$Unit$none$none' : 'GSOL$Unit$none$none';
+  99:           const url = new URL(`${config.galadexApiBase}/v1/trade/quote`);
+ 100:           url.searchParams.set('tokenIn', tokenIn);
+ 101:           url.searchParams.set('tokenOut', tokenOut);
+ 102:           url.searchParams.set('amountIn', String(amountInUi));
+ 103:           url.searchParams.set('fee', String(config.galadexFeeTier ?? 10000));
+ 104:           await this.rateLimit();
+ 105:           const resp = await fetch(url.toString(), { method: 'GET' });
+ 106:           if (!resp.ok) return null;
+ 107:           const data: any = await resp.json();
+ 108:           if (!data || data.status !== 200 || !data.data || data.data.amountOut == null) return null;
+ 109:           const amountOutUi = Number(data.data.amountOut);
+ 110:           const outAmount = fromUi(amountOutUi, outInfo.decimals);
+ 111:           const price = amountOutUi / (amountInUi || 1);
+ 112:           return {
+ 113:             inSymbol,
+ 114:             outSymbol,
+ 115:             inAmount,
+ 116:             outAmount,
+ 117:             price,
+ 118:             venue: this.name,
+ 119:           };
+ 120:         } catch (e) {
+ 121:           console.warn('[GalaSwap] HTTP quote failed, falling back to mock pool:', e);
+ 122:         }
+ 123:       }
+ 124:     }
+ 125: 
+ 126:     // Fallback: use mock pool if available
+ 127:     const pools = await this.getPools([inSymbol, outSymbol]);
+ 128:     if (pools.length === 0) return null;
+ 129:     const p = pools[0];
+ 130:     const aToB = p.tokenA.symbol === inSymbol;
+ 131:     const reserveIn = aToB ? p.reserveA : p.reserveB;
+ 132:     const reserveOut = aToB ? p.reserveB : p.reserveA;
+ 133:     const outAmount = constantProductOutAmount(inAmount, reserveIn, reserveOut, p.feeBps);
+ 134:     const price = toUi(outAmount, aToB ? p.tokenB.decimals : p.tokenA.decimals) /
+ 135:       (toUi(inAmount, aToB ? p.tokenA.decimals : p.tokenB.decimals) || 1);
+ 136:     return {
+ 137:       inSymbol,
+ 138:       outSymbol,
+ 139:       inAmount,
+ 140:       outAmount,
+ 141:       price,
+ 142:       venue: this.name,
+ 143:       poolId: p.id,
+ 144:     };
+ 145:   }
+ 146: 
+ 147:   async buildSwapTransaction(opts?: { inSymbol: string; outSymbol: string; inAmount: bigint; minOutAmount: bigint }): Promise<{ description: string } | null> {
+ 148:     // Implement HTTP flow skeleton for live trading (DRY_RUN recommended until tested):
+ 149:     if (!config.galadexApiBase) return { description: 'GalaSwap: HTTP API base missing.' };
+ 150:     if (!config.galadexPrivateKey) return { description: 'GalaSwap: GALADEX_PRIVATE_KEY missing.' };
+ 151:     try {
+ 152:       const isBuy = opts?.inSymbol?.toUpperCase() === 'SOL';
+ 153:       const tokenInDef = isBuy
+ 154:         ? { collection: 'GSOL', category: 'Unit', type: 'none', additionalKey: 'none' }
+ 155:         : { collection: 'GALA', category: 'Unit', type: 'none', additionalKey: 'none' };
+ 156:       const tokenOutDef = isBuy
+ 157:         ? { collection: 'GALA', category: 'Unit', type: 'none', additionalKey: 'none' }
+ 158:         : { collection: 'GSOL', category: 'Unit', type: 'none', additionalKey: 'none' };
+ 159: 
+ 160:       const amountInUi = opts ? toUi(opts.inAmount, getToken(opts.inSymbol)!.decimals) : 0;
+ 161:       const amountInStr = String(amountInUi);
+ 162:       const amountInMaximum = String(amountInUi * (1 + (config.slippageBps / 10_000)));
+ 163:       const amountOutMinimum = '0';
+ 164: 
+ 165:       const swapUrl = `${config.galadexApiBase}/v1/trade/swap`;
+ 166:       await this.rateLimit();
+ 167:       const swapResp = await fetch(swapUrl, {
+ 168:         method: 'POST',
+ 169:         headers: { 'content-type': 'application/json' },
+ 170:         body: JSON.stringify({
+ 171:           tokenIn: tokenInDef,
+ 172:           tokenOut: tokenOutDef,
+ 173:           amountIn: amountInStr,
+ 174:           fee: config.galadexFeeTier ?? 10000,
+ 175:           sqrtPriceLimit: '0',
+ 176:           amountInMaximum,
+ 177:           amountOutMinimum,
+ 178:         }),
+ 179:       });
+ 180:       if (!swapResp.ok) return { description: `GalaSwap swap request failed: ${swapResp.status}` };
+ 181:       const swapData: any = await swapResp.json();
+ 182:       if (!(swapData && swapData.status === 200 && swapData.data)) {
+ 183:         return { description: 'GalaSwap: unexpected swap response' };
+ 184:       }
+ 185:       const unsignedPayload = swapData.data;
+ 186: 
+ 187:       // Sign payload
+ 188:       const signature = getSignature({ payload: unsignedPayload, privateKeyHex: config.galadexPrivateKey, order: 'sorted', signMode: 'hash', vMode: 'eth', hexPrefix: false });
+ 189:       const userAddrRaw = config.galadexWalletAddress?.trim();
+ 190:       let user = userAddrRaw || '';
+ 191:       if (user.startsWith('eth|') || user.startsWith('client|')) {
+ 192:         // keep
+ 193:       } else if (user.startsWith('0x') || user.startsWith('0X')) {
+ 194:         user = 'eth|' + user.slice(2);
+ 195:       } else {
+ 196:         const derived = getEthAddress(config.galadexPrivateKey);
+ 197:         user = 'eth|' + derived.slice(2);
+ 198:       }
+ 199: 
+ 200:       // Bundle submit object
+ 201:       const bundle = { payload: unsignedPayload, type: 'swap', signature, user };
+ 202:       return { description: `GalaSwap bundle prepared (user=${user}, sig_len=${signature.length})` };
+ 203:     } catch (e: any) {
+ 204:       return { description: `GalaSwap build error: ${e?.message || e}` };
+ 205:     }
+ 206:   }
+ 207: }
+ 208: 
+ 209: 
